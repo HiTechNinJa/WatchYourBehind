@@ -53,13 +53,13 @@ void loop() {
     // 示例：简单的检测逻辑 (Example: Simple detection logic)
     // 如果接收到包含特定关键词的数据，认为检测到人体存在
     // If data contains specific keywords, consider presence detected
-    if (radarData.indexOf("presence") >= 0 || radarData.indexOf("detected") >= 0) {
+    if (radarData.indexOf("presence") >= 0 || radarData.indexOf("detected") >= 0 || radarData.indexOf("occupied") >= 0) {
       if (!presenceDetected) {
         presenceDetected = true;
         digitalWrite(LED_PIN, HIGH);
         Serial.println("✓ 检测到人体存在 (Presence detected)");
       }
-    } else if (radarData.indexOf("absence") >= 0 || radarData.indexOf("no") >= 0) {
+    } else if (radarData.indexOf("absence") >= 0 || radarData.indexOf("no_presence") >= 0 || radarData.indexOf("unoccupied") >= 0) {
       if (presenceDetected) {
         presenceDetected = false;
         digitalWrite(LED_PIN, LOW);
