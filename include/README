@@ -1,0 +1,15 @@
+/*
+ * 这个文件可以用来放置自定义的头文件
+ * This file can be used to place custom header files
+ * 
+ * 例如: 雷达数据解析相关的函数声明
+ * Example: Function declarations related to radar data parsing
+ */
+
+#ifndef RADAR_CONFIG_H
+#define RADAR_CONFIG_H
+
+// 可以在这里添加雷达相关的配置和函数声明
+// You can add radar-related configurations and function declarations here
+
+#endif // RADAR_CONFIG_H
