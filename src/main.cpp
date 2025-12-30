@@ -10,6 +10,9 @@ bool isBaudLocked = false;
 unsigned long lastDataPrintTime = 0;
 const unsigned long DATA_PRINT_INTERVAL = 3000; // 3秒输出一次雷达坐标数据
 
+// 显示模式控制
+bool viewRawMode = false; // false=解析模式(默认), true=透传(Hex)模式
+
 // 自动检测相关
 unsigned long lastAutoCheckTime = 0;
 const unsigned long AUTO_CHECK_INTERVAL = 10000; // 10秒检查一次
@@ -24,7 +27,7 @@ bool awaitingConfirmation = false;
 String pendingCmdName = "";
 uint16_t pendingCmdWord = 0;
 uint16_t pendingCmdValInt = 0;
-bool pendingUseInt = true;
+uint16_t pendingCmdLen = 0; 
 
 // 雷达数据缓冲区
 const uint8_t HEAD[] = {0xAA, 0xFF, 0x03, 0x00};
@@ -51,7 +54,7 @@ void enableConfig(bool silent = false);
 void endConfig(bool silent = false);
 
 // 危险操作请求函数
-void requestAction(const char* name, uint16_t cmdWord, uint16_t valInt) {
+void requestAction(const char* name, uint16_t cmdWord, uint16_t valInt, uint16_t len) {
     Serial.printf("\n[!!! WARNING !!!] You are about to execute: %s\n", name);
     Serial.println("Type 'yes' to confirm, or anything else to cancel.");
     
@@ -59,7 +62,7 @@ void requestAction(const char* name, uint16_t cmdWord, uint16_t valInt) {
     pendingCmdName = String(name);
     pendingCmdWord = cmdWord;
     pendingCmdValInt = valInt;
-    pendingUseInt = true;
+    pendingCmdLen = len; 
     awaitingConfirmation = true;
 }
 
@@ -75,17 +78,68 @@ void queryAllInfo() {
 
 // === 后台自动检测 ===
 void performAutoCheck() {
-    // 这是一个静默过程，除非发现配置变化
-    // 注意：进入配置模式会短暂中断雷达数据上报
-    
     enableConfig(true); // 静默进入
-    
-    // 发送查询模式指令
     sendRadarPacket(0x0091, NULL, 0); 
-    // 静默等待ACK，waitForAck 内部负责比对 lastKnownMode
     waitForAck(0x0091, 300, true); 
-    
     endConfig(true); // 静默退出
+}
+
+// === 透传桥接模式 ===
+void runBridgeMode() {
+    Serial.println("\n\n================================================");
+    Serial.println("       ENTERING TRANSPARENT BRIDGE MODE         ");
+    Serial.println("================================================");
+    Serial.println("1. ESP32 is now a USB-TTL bridge.");
+    Serial.println("2. CLOSE this Serial Monitor now.");
+    Serial.println("3. OPEN 'HLK-LD2450 Tool' and connect to this COM port.");
+    Serial.println("4. To Exit: Press the RST (Reset) button on ESP32.");
+    Serial.println("================================================\n");
+    
+    delay(100);
+    while(Serial.available()) Serial.read();
+    while(Serial1.available()) Serial1.read();
+
+    while(true) {
+        if (Serial.available()) Serial1.write(Serial.read());
+        if (Serial1.available()) Serial.write(Serial1.read());
+        yield();
+    }
+}
+
+// === 发送自定义 HEX 字符串 ===
+void sendRawHex(String commandStr) {
+    String hexStr = commandStr.substring(4);
+    hexStr.trim();
+    if (hexStr.length() == 0) { Serial.println("Usage: send FD FC FB FA ..."); return; }
+
+    Serial.print("[TX RAW] ");
+    String currentByte = "";
+    for (unsigned int i = 0; i < hexStr.length(); i++) {
+        char c = hexStr.charAt(i);
+        if (c == ' ') continue;
+        currentByte += c;
+        if (currentByte.length() == 2) {
+            uint8_t val = (uint8_t)strtol(currentByte.c_str(), NULL, 16);
+            Serial1.write(val);
+            Serial.printf("%02X ", val);
+            currentByte = "";
+        }
+    }
+    if (currentByte.length() > 0) {
+        uint8_t val = (uint8_t)strtol(currentByte.c_str(), NULL, 16);
+        Serial1.write(val);
+        Serial.printf("%02X ", val);
+    }
+    Serial.println();
+    
+    if (!viewRawMode) {
+        Serial.println("(Switching to RAW view temporarily for response...)");
+        unsigned long startWait = millis();
+        while(millis() - startWait < 1000) {
+            if (Serial1.available()) Serial.printf("%02X ", Serial1.read());
+        }
+        Serial.println("\n(Done)");
+    }
 }
 
 // ================= 标准指令封装 =================
@@ -157,7 +211,16 @@ void loop() {
             if (awaitingConfirmation) {
                 if (cmd.equalsIgnoreCase("yes")) {
                     Serial.println(">> Confirmed. Executing...");
-                    runCmd(pendingCmdName.c_str(), pendingCmdWord, pendingCmdValInt);
+                    
+                    if (pendingCmdLen == 0) {
+                        runCmd(pendingCmdName.c_str(), pendingCmdWord, NULL, 0);
+                    } else {
+                        uint8_t valArr[2];
+                        valArr[0] = (uint8_t)(pendingCmdValInt & 0xFF);
+                        valArr[1] = (uint8_t)((pendingCmdValInt >> 8) & 0xFF);
+                        runCmd(pendingCmdName.c_str(), pendingCmdWord, valArr, pendingCmdLen);
+                    }
+                    
                 } else {
                     Serial.println(">> Cancelled.");
                 }
@@ -165,8 +228,15 @@ void loop() {
                 return; 
             }
 
+            // --- 透传/发送指令 ---
+            if (cmd.equalsIgnoreCase("bridge")) {
+                runBridgeMode(); 
+            }
+            else if (cmd.startsWith("send ")) {
+                sendRawHex(cmd);
+            }
             // --- 普通命令解析 ---
-            if (cmd == "?" || cmd == "help") {
+            else if (cmd == "?" || cmd == "help") {
                 printHelp(false);
             }
             else if (cmd == "-a" || cmd == "all") {
@@ -178,6 +248,16 @@ void loop() {
             else if (cmd.equalsIgnoreCase("info")) { 
                 queryAllInfo();
             }
+            // === 视图切换指令 ===
+            else if (cmd.equalsIgnoreCase("raw")) {
+                viewRawMode = true;
+                Serial.println("\n>>> 已切换为【透传模式】(Hex View) <<<");
+            }
+            else if (cmd.equalsIgnoreCase("parse")) {
+                viewRawMode = false;
+                Serial.println("\n>>> 已切换为【解析模式】(Parsed View) <<<");
+            }
+            // ===================
             else if (cmd.equalsIgnoreCase("ver")) {
                 runCmd("Query Version", 0x00A0, NULL, 0);
             }
@@ -205,18 +285,19 @@ void loop() {
                 runCmd("BLE OFF", 0x00A4, (uint16_t)0x0000);
             }
             
-            // === 危险指令 ===
+            // === 危险指令 (无需参数) ===
             else if (cmd.equalsIgnoreCase("reboot")) {
-                requestAction("Reboot Module", 0x00A3, 0);
+                requestAction("Reboot Module", 0x00A3, 0, 0); 
             }
             else if (cmd.equalsIgnoreCase("factory")) {
-                requestAction("Factory Reset", 0x00A2, 0);
+                requestAction("Factory Reset", 0x00A2, 0, 0); 
             }
+            // === 危险指令 (需参数) ===
             else if (cmd.startsWith("baud")) {
                 if (cmd.indexOf("256000") != -1) {
-                    requestAction("Set Baud 256000", 0x00A1, 0x0007);
+                    requestAction("Set Baud 256000", 0x00A1, 0x0007, 2); 
                 } else if (cmd.indexOf("115200") != -1) {
-                    requestAction("Set Baud 115200", 0x00A1, 0x0005);
+                    requestAction("Set Baud 115200", 0x00A1, 0x0005, 2); 
                 } else {
                     Serial.println("Usage: baud 256000");
                 }
@@ -227,8 +308,8 @@ void loop() {
         }
     }
 
-    // 2. 自动检测逻辑 (每10秒执行一次)
-    if (isBaudLocked && millis() - lastAutoCheckTime > AUTO_CHECK_INTERVAL) {
+    // 2. 自动检测逻辑
+    if (!viewRawMode && isBaudLocked && millis() - lastAutoCheckTime > AUTO_CHECK_INTERVAL) {
         performAutoCheck();
         lastAutoCheckTime = millis();
     }
@@ -244,8 +325,14 @@ void loop() {
 void printHelp(bool showAll) {
     Serial.println("\n\n================ LD2450 安全控制台 ================");
     Serial.println(" [提示] 输入命令后按回车发送");
-    Serial.println(" [自动] 系统每10秒会自动检查一次配置，如有变更会提示。");
+    Serial.println(" [自动] 系统每10秒会自动检查一次配置(仅在解析模式下)。");
     
+    Serial.println("\n--- 透传与连接 ---");
+    Serial.printf("  %-14s : %s\n", "bridge", "【桥接】进入透明传输模式 (连接官方上位机用)");
+    Serial.printf("  %-14s : %s\n", "raw", "【查看】显示原始 Hex 数据 (无延迟)");
+    Serial.printf("  %-14s : %s\n", "parse", "【查看】显示解析后的坐标 (3秒一次)");
+    Serial.printf("  %-14s : %s\n", "send <hex>", "【发送】发送原始 HEX (如: send FD FC ...)");
+
     Serial.println("\n--- 调试工具 ---");
     Serial.printf("  %-14s : %s\n", "info", "一键查询所有状态");
 
@@ -297,15 +384,18 @@ bool waitForAck(uint16_t sentCmd, unsigned long timeoutMs, bool silent) {
                          return false;
                      }
                      
-                     // --- 0x0091 Mode Query 解析逻辑 ---
-                     if (sentCmd == 0x0091) { // mode
+                     // --- [新增] BLE 设置成功后的特殊提示 ---
+                     if (sentCmd == 0x00A4) {
+                         Serial.println("SUCCESS -> Bluetooth config saved.");
+                         Serial.println(">> NOTICE: Please execute 'reboot' command to apply changes! <<");
+                     }
+                     // --- Mode Query ---
+                     else if (sentCmd == 0x0091) { // mode
                          uint16_t mode = ackBuf[10] | (ackBuf[11] << 8);
                          
-                         // 如果是手动查询，总是打印
                          if (!silent) {
                              Serial.printf("SUCCESS -> Mode: %s\n", (mode == 0x02) ? "Multi Target" : "Single Target");
                          }
-                         // 如果是自动检测，只有变化了才打印
                          else {
                              if (lastKnownMode != -1 && mode != lastKnownMode) {
                                  Serial.println("\n\n-----------------------------------------");
@@ -313,10 +403,9 @@ bool waitForAck(uint16_t sentCmd, unsigned long timeoutMs, bool silent) {
                                  Serial.println("-----------------------------------------\n");
                              }
                          }
-                         // 更新记录
                          lastKnownMode = mode;
                      }
-                     // --- 其他指令解析 (自动模式下通常不会触发这些) ---
+                     // --- Other Cmds ---
                      else if (!silent) {
                          if (sentCmd == 0x00A0) { // ver
                              uint16_t major = ackBuf[12] | (ackBuf[13] << 8);
@@ -343,7 +432,6 @@ bool waitForAck(uint16_t sentCmd, unsigned long timeoutMs, bool silent) {
                          else if (sentCmd == 0x00FE) Serial.println("ENDED");
                          else Serial.println("SUCCESS");
                      }
-                     
                      return true;
                 }
                 ackIdx = 0; 
@@ -406,25 +494,37 @@ void parseRadarByte(uint8_t b) {
     } else {
         radarBuf[radarBufIdx++] = b;
         if (radarBufIdx >= 64) radarBufIdx = 0;
+        
         if (radarBufIdx >= 30 && radarBuf[28] == TAIL[0] && radarBuf[29] == TAIL[1]) {
-            if (millis() - lastDataPrintTime > DATA_PRINT_INTERVAL) {
-                String output = "Target: ";
-                bool hasTarget = false;
-                for (int i=0; i<3; i++) {
-                    int base = 4 + i*8;
-                    int16_t x = parseCoordinate(radarBuf[base] | (radarBuf[base+1]<<8));
-                    int16_t y = parseCoordinate(radarBuf[base+2] | (radarBuf[base+3]<<8));
-                    if (x != 0 || y != 0) {
-                        char tmp[32];
-                        sprintf(tmp, "[T%d %d,%d] ", i+1, x, y);
-                        output += String(tmp);
-                        hasTarget = true;
-                    }
+            if (viewRawMode) {
+                Serial.print("RAW: ");
+                for (int i = 0; i < radarBufIdx; i++) {
+                    Serial.printf("%02X ", radarBuf[i]);
                 }
-                if (hasTarget) Serial.println(output);
-                else Serial.print(".");
-                lastDataPrintTime = millis();
-            } else { if (millis() % 500 < 20 && millis() % 100 == 0) Serial.print("."); }
+                Serial.println();
+            }
+            else {
+                if (millis() - lastDataPrintTime > DATA_PRINT_INTERVAL) {
+                    String output = "Target: ";
+                    bool hasTarget = false;
+                    for (int i=0; i<3; i++) {
+                        int base = 4 + i*8;
+                        int16_t x = parseCoordinate(radarBuf[base] | (radarBuf[base+1]<<8));
+                        int16_t y = parseCoordinate(radarBuf[base+2] | (radarBuf[base+3]<<8));
+                        if (x != 0 || y != 0) {
+                            char tmp[32];
+                            sprintf(tmp, "[T%d %d,%d] ", i+1, x, y);
+                            output += String(tmp);
+                            hasTarget = true;
+                        }
+                    }
+                    if (hasTarget) Serial.println(output);
+                    else Serial.print(".");
+                    lastDataPrintTime = millis();
+                } else { 
+                    if (millis() % 500 < 20 && millis() % 100 == 0) Serial.print("."); 
+                }
+            }
             radarBufIdx = 0;
         }
     }
