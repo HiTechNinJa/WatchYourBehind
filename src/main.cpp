@@ -1,4 +1,89 @@
+
 #include <Arduino.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+// ================= 网络配置 =================
+const char* WIFI_SSID = "Link2you?"; // TODO: 替换为实际WiFi YOUR_WIFI_SSID
+const char* WIFI_PASS = "12345678";//YOUR_WIFI_PASSWORD
+const char* SERVER_URL = "http://link2you.top:5000/api/v1/device/sync";
+
+unsigned long lastUploadTime = 0;
+unsigned long uploadInterval = 1000; // 默认1秒
+
+// 目标数据结构
+struct Target {
+    int16_t x;
+    int16_t y;
+    int16_t speed;
+    int16_t resolution;
+};
+
+Target targets[3];
+
+// 补充全局变量声明
+extern uint8_t radarBuf[64];
+int16_t parseCoordinate(uint16_t raw);
+
+// 解析雷达数据并填充targets数组
+void parseTargetsFromRadarBuf() {
+    for (int i = 0; i < 3; i++) {
+        int base = 4 + i * 8;
+        targets[i].x = parseCoordinate(radarBuf[base] | (radarBuf[base+1]<<8));
+        targets[i].y = parseCoordinate(radarBuf[base+2] | (radarBuf[base+3]<<8));
+        targets[i].speed = 0; // 可根据协议补充
+        targets[i].resolution = 0;
+    }
+}
+
+// 全局变量：仅开机获取一次MAC
+String deviceMac = "";
+
+// JSON封装并上传到服务器（仅用全局MAC，动态调整上传频率）
+void uploadDataToServer() {
+    if (WiFi.status() != WL_CONNECTED) return;
+    WiFiClient client;
+    HTTPClient http;
+    http.begin(client, SERVER_URL);
+    http.addHeader("Content-Type", "application/json");
+
+    // 使用新版API，消除警告
+    ArduinoJson::StaticJsonDocument<256> doc;
+    doc["device_mac"] = deviceMac;
+    auto arr = doc["targets"].to<ArduinoJson::JsonArray>();
+    for (int i = 0; i < 3; i++) {
+        auto obj = arr.add<ArduinoJson::JsonObject>();
+        obj["x"] = targets[i].x;
+        obj["y"] = targets[i].y;
+        obj["speed"] = targets[i].speed;
+        obj["resolution"] = targets[i].resolution;
+    }
+
+    String payload;
+    serializeJson(doc, payload);
+
+    int httpCode = http.POST(payload);
+    if (httpCode > 0) {
+        String resp = http.getString();
+        // 解析响应，动态调整上传间隔（支持加速/降频）
+        ArduinoJson::StaticJsonDocument<256> respDoc;
+        ArduinoJson::DeserializationError err = deserializeJson(respDoc, resp);
+        if (!err && respDoc["data"]["next_interval"]) {
+            unsigned long nextInt = respDoc["data"]["next_interval"].as<unsigned long>();
+            // 只在值变化时打印提示
+            if (nextInt != uploadInterval) {
+                if (nextInt <= 100) {
+                    Serial.println("[SYNC] 进入加速上传模式 (10Hz)");
+                } else {
+                    Serial.println("[SYNC] 切换为低频上传 (1Hz)");
+                }
+            }
+            uploadInterval = nextInt;
+        }
+        // 处理pending_cmd等可扩展
+    }
+    http.end();
+}
 
 // ================= 引脚定义 =================
 #define RX_PIN 16
@@ -202,8 +287,33 @@ void setup() {
     Serial.println("\n\n==============================================");
     Serial.println("      LD2450 Radar Controller (Safe Init)     ");
     Serial.println("==============================================");
-    
-    scanBaudRate(); 
+
+    // WiFi连接
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    Serial.print("Connecting to WiFi");
+    int wifiTry = 0;
+    while (WiFi.status() != WL_CONNECTED && wifiTry < 20) {
+        delay(500);
+        Serial.print(".");
+        wifiTry++;
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("\nWiFi connected!");
+        Serial.print("IP: ");
+        Serial.println(WiFi.localIP());
+        // 仅开机时获取一次MAC
+        deviceMac = WiFi.macAddress();
+        Serial.print("Device MAC: ");
+        Serial.println(deviceMac);
+    } else {
+        Serial.println("\nWiFi connect failed, continue serial only.");
+    }
+
+    scanBaudRate();
+
+        // [新增] 上电后自动重启雷达
+        runCmd("Reboot Module", 0x00A3, NULL, 0);
 }
 
 void loop() {
@@ -333,7 +443,17 @@ void loop() {
 
     // 3. 处理雷达数据流
     if (isBaudLocked && Serial1.available()) {
-        parseRadarByte(Serial1.read());
+        uint8_t b = Serial1.read();
+        parseRadarByte(b);
+
+        // 检查是否完整帧并上报
+        if (radarBufIdx == 0 && WiFi.status() == WL_CONNECTED) {
+            parseTargetsFromRadarBuf();
+            if (millis() - lastUploadTime > uploadInterval) {
+                uploadDataToServer();
+                lastUploadTime = millis();
+            }
+        }
     }
 }
 
