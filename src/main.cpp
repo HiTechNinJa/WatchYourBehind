@@ -53,6 +53,15 @@ void runCmd(const char* name, uint16_t cmdWord, uint16_t valInt);
 void enableConfig(bool silent = false);
 void endConfig(bool silent = false);
 
+// [新增] 脏数据清理函数
+void clearSerialBuffer() {
+    unsigned long start = millis();
+    // 持续读取直到缓冲区为空，或者超过50ms（防止死循环）
+    while ((Serial1.available() > 0) && (millis() - start < 50)) {
+        Serial1.read();
+    }
+}
+
 // 危险操作请求函数
 void requestAction(const char* name, uint16_t cmdWord, uint16_t valInt, uint16_t len) {
     Serial.printf("\n[!!! WARNING !!!] You are about to execute: %s\n", name);
@@ -69,9 +78,9 @@ void requestAction(const char* name, uint16_t cmdWord, uint16_t valInt, uint16_t
 // 批量查询当前状态
 void queryAllInfo() {
     Serial.println("\n=== Fetching Device Status ===");
-    runCmd("Query Version", 0x00A0, NULL, 0); delay(50);
-    runCmd("Query MAC", 0x00A5, (uint16_t)0x0001); delay(50);
-    runCmd("Query Mode", 0x0091, NULL, 0); delay(50);
+    runCmd("Query Version", 0x00A0, NULL, 0); delay(100); 
+    runCmd("Query MAC", 0x00A5, (uint16_t)0x0001); delay(100);
+    runCmd("Query Mode", 0x0091, NULL, 0); delay(100);
     runCmd("Query Zone", 0x00C1, NULL, 0);
     Serial.println("=== Status Report Complete ===\n");
 }
@@ -79,8 +88,10 @@ void queryAllInfo() {
 // === 后台自动检测 ===
 void performAutoCheck() {
     enableConfig(true); // 静默进入
+    delay(20); 
     sendRadarPacket(0x0091, NULL, 0); 
     waitForAck(0x0091, 300, true); 
+    delay(20); 
     endConfig(true); // 静默退出
 }
 
@@ -96,8 +107,7 @@ void runBridgeMode() {
     Serial.println("================================================\n");
     
     delay(100);
-    while(Serial.available()) Serial.read();
-    while(Serial1.available()) Serial1.read();
+    clearSerialBuffer(); // 进入前清理
 
     while(true) {
         if (Serial.available()) Serial1.write(Serial.read());
@@ -159,10 +169,18 @@ void endConfig(bool silent) {
 
 void runCmd(const char* name, uint16_t cmdWord, uint8_t* val, uint16_t valLen) {
     Serial.printf("\n--- Executing: %s ---\n", name);
+    
+    // [Fix] 这里的清理依然保留
+    clearSerialBuffer();
+
     enableConfig(false);
+    delay(50);
+    
     Serial.printf("[CMD] Sending Packet...  ");
     sendRadarPacket(cmdWord, val, valLen);
     waitForAck(cmdWord, 600, false); 
+    delay(50);
+    
     endConfig(false);
     Serial.println("--- Done ---\n");
 }
@@ -182,7 +200,7 @@ void setup() {
     
     delay(1000);
     Serial.println("\n\n==============================================");
-    Serial.println("      LD2450 Radar Controller (Smart Check)   ");
+    Serial.println("      LD2450 Radar Controller (Safe Init)     ");
     Serial.println("==============================================");
     
     scanBaudRate(); 
@@ -285,14 +303,13 @@ void loop() {
                 runCmd("BLE OFF", 0x00A4, (uint16_t)0x0000);
             }
             
-            // === 危险指令 (无需参数) ===
+            // === 危险指令 ===
             else if (cmd.equalsIgnoreCase("reboot")) {
                 requestAction("Reboot Module", 0x00A3, 0, 0); 
             }
             else if (cmd.equalsIgnoreCase("factory")) {
                 requestAction("Factory Reset", 0x00A2, 0, 0); 
             }
-            // === 危险指令 (需参数) ===
             else if (cmd.startsWith("baud")) {
                 if (cmd.indexOf("256000") != -1) {
                     requestAction("Set Baud 256000", 0x00A1, 0x0007, 2); 
@@ -384,12 +401,10 @@ bool waitForAck(uint16_t sentCmd, unsigned long timeoutMs, bool silent) {
                          return false;
                      }
                      
-                     // --- [新增] BLE 设置成功后的特殊提示 ---
                      if (sentCmd == 0x00A4) {
                          Serial.println("SUCCESS -> Bluetooth config saved.");
                          Serial.println(">> NOTICE: Please execute 'reboot' command to apply changes! <<");
                      }
-                     // --- Mode Query ---
                      else if (sentCmd == 0x0091) { // mode
                          uint16_t mode = ackBuf[10] | (ackBuf[11] << 8);
                          
@@ -405,7 +420,6 @@ bool waitForAck(uint16_t sentCmd, unsigned long timeoutMs, bool silent) {
                          }
                          lastKnownMode = mode;
                      }
-                     // --- Other Cmds ---
                      else if (!silent) {
                          if (sentCmd == 0x00A0) { // ver
                              uint16_t major = ackBuf[12] | (ackBuf[13] << 8);
@@ -442,41 +456,72 @@ bool waitForAck(uint16_t sentCmd, unsigned long timeoutMs, bool silent) {
     return false;
 }
 
+// 扫描波特率逻辑 (增加清洗)
 void scanBaudRate() {
     isBaudLocked = false;
-    const long RATES[] = {256000, 115200}; // 仅扫描常用，提高速度
+    const long RATES[] = {256000, 115200}; 
     int numRates = sizeof(RATES) / sizeof(RATES[0]);
     
     Serial.println("\n--- Scanning Baud Rate ---");
-    for (int i = 0; i < numRates; i++) {
-        long rate = RATES[i];
-        Serial.printf("Trying %ld... ", rate);
-        Serial1.end();
-        Serial1.setRxBufferSize(2048);
-        Serial1.begin(rate, SERIAL_8N1, RX_PIN, TX_PIN);
+
+    while(!isBaudLocked) {
+        for (int i = 0; i < numRates; i++) {
+            long rate = RATES[i];
+            Serial.printf("Trying %ld... ", rate);
+            
+            Serial1.end();
+            Serial1.setRxBufferSize(2048);
+            Serial1.begin(rate, SERIAL_8N1, RX_PIN, TX_PIN);
+            
+            // [新增] 关键：等待串口稳定并清理脏数据
+            delay(50);
+            clearSerialBuffer();
+            
+            unsigned long scanStart = millis();
+            int matchCount = 0;
+            int cfgMatchCount = 0;
+            bool found = false;
+            
+            while (millis() - scanStart < 1200) {
+                if (Serial1.available()) {
+                    uint8_t b = Serial1.read();
+                    
+                    if (matchCount == 0 && b == 0xAA) matchCount++;
+                    else if (matchCount == 1 && b == 0xFF) matchCount++;
+                    else if (matchCount == 2 && b == 0x03) matchCount++;
+                    else if (matchCount == 3 && b == 0x00) { found = true; break; }
+                    else { if (b == 0xAA) matchCount = 1; else matchCount = 0; }
+                    
+                    if (cfgMatchCount == 0 && b == 0xFD) cfgMatchCount++;
+                    else if (cfgMatchCount == 1 && b == 0xFC) cfgMatchCount++;
+                    else if (cfgMatchCount == 2 && b == 0xFB) cfgMatchCount++;
+                    else if (cfgMatchCount == 3 && b == 0xFA) { found = true; break; }
+                    else { if (b == 0xFD) cfgMatchCount = 1; else cfgMatchCount = 0; }
+                }
+            }
+            if (found) {
+                Serial.println("LOCKED!");
+                currentBaudRate = rate;
+                isBaudLocked = true;
+                Serial.println("Ready. Type '?' for help.");
+                printHelp(false);
+                return;
+            } else { Serial.println("No"); }
+        }
         
-        unsigned long scanStart = millis();
-        int matchCount = 0;
-        bool found = false;
-        while (millis() - scanStart < 1200) {
-            if (Serial1.available()) {
-                uint8_t b = Serial1.read();
-                if (matchCount == 0 && b == 0xAA) matchCount++;
-                else if (matchCount == 1 && b == 0xFF) matchCount++;
-                else if (matchCount == 2 && b == 0x03) matchCount++;
-                else if (matchCount == 3 && b == 0x00) { found = true; break; }
-                else { if (b == 0xAA) matchCount = 1; else matchCount = 0; }
+        Serial.println("Scan failed. Auto-retrying in 2 seconds...");
+        Serial.println("(Press any key to stop scanning and enter console)");
+        
+        unsigned long waitStart = millis();
+        while(millis() - waitStart < 2000) {
+            if (Serial.available()) {
+                Serial.println("\n>> Scan aborted by user.");
+                isBaudLocked = true; 
+                return;
             }
         }
-        if (found) {
-            Serial.println("LOCKED!");
-            currentBaudRate = rate;
-            isBaudLocked = true;
-            Serial.println("Ready. Type '?' for help.");
-            return;
-        } else { Serial.println("No"); }
+        Serial.println("\n--- Retrying Scan ---");
     }
-    Serial.println("Scan failed.");
 }
 
 int16_t parseCoordinate(uint16_t raw) {
@@ -522,7 +567,7 @@ void parseRadarByte(uint8_t b) {
                     else Serial.print(".");
                     lastDataPrintTime = millis();
                 } else { 
-                    if (millis() % 500 < 20 && millis() % 100 == 0) Serial.print("."); 
+                    if (millis() % 500 < 20 && millis() % 100 == 0) Serial.print("❤️\n"); 
                 }
             }
             radarBufIdx = 0;
