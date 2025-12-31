@@ -1,15 +1,8 @@
 
 #include <Arduino.h>
-#include <WiFi.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
-// ================= 网络配置 =================
-const char* WIFI_SSID = "Link2you?"; // WiFi YOUR_WIFI_SSID
-const char* WIFI_PASS = "12345678";//YOUR_WIFI_PASSWORD
-const char* SERVER_URL = "http://link2you.top:5000/api/v1/device/sync";
-
-unsigned long lastUploadTime = 0;
-unsigned long uploadInterval = 1000; // 默认1秒
+#include "wifi/wifi_config.h"
 
 // 目标数据结构
 struct Target {
@@ -23,7 +16,6 @@ Target targets[3];
 
 // 补充全局变量声明
 extern uint8_t radarBuf[64];
-int16_t parseCoordinate(uint16_t raw);
 
 // 自动检测相关全局变量
 int lastKnownMode = -1; // -1 表示未知，用于对比配置变化
@@ -32,38 +24,24 @@ int lastKnownMode = -1; // -1 表示未知，用于对比配置变化
 void parseTargetsFromRadarBuf() {
     for (int i = 0; i < 3; i++) {
         int base = 4 + i * 8;
-        targets[i].x = parseCoordinate(radarBuf[base] | (radarBuf[base+1]<<8));
-        targets[i].y = parseCoordinate(radarBuf[base+2] | (radarBuf[base+3]<<8));
-        targets[i].speed = parseCoordinate(radarBuf[base+4] | (radarBuf[base+5]<<8));
+        uint16_t rawX = radarBuf[base] | (radarBuf[base+1]<<8);
+        uint16_t rawY = radarBuf[base+2] | (radarBuf[base+3]<<8);
+        uint16_t rawSpeed = radarBuf[base+4] | (radarBuf[base+5]<<8);
+        
+        // X坐标：最高位决定正负
+        targets[i].x = (rawX & 0x8000) ? (int16_t)(rawX - 0x8000) : -(int16_t)(rawX & 0x7FFF);
+        // Y坐标：总是正坐标，减去32768
+        targets[i].y = (int16_t)(rawY - 0x8000);
+        // 速度：最高位决定正负
+        targets[i].speed = (rawSpeed & 0x8000) ? (int16_t)(rawSpeed - 0x8000) : -(int16_t)(rawSpeed & 0x7FFF);
+        
         targets[i].resolution = radarBuf[base+6] | (radarBuf[base+7]<<8);
     }
 }
 
-// 全局变量：仅开机获取一次MAC
-String deviceMac = "";
-
 // WiFi连接状态检测与自动重连
-void checkWiFiAndReconnect() {
-    if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("[WiFi] 连接丢失，正在尝试重连...");
-        WiFi.disconnect();
-        WiFi.begin(WIFI_SSID, WIFI_PASS);
-        int wifiTry = 0;
-        while (WiFi.status() != WL_CONNECTED && wifiTry < 10) {
-            delay(500);
-            Serial.print(".");
-            wifiTry++;
-        }
-        if (WiFi.status() == WL_CONNECTED) {
-            Serial.println("\n[WiFi] 重新连接成功!");
-            Serial.print("IP: ");
-            Serial.println(WiFi.localIP());
-            deviceMac = WiFi.macAddress();
-        } else {
-            Serial.println("\n[WiFi] 重新连接失败。");
-        }
-    }
-}
+// 注意：此函数已在wifi_config.cpp中实现，这里不再重复定义
+// void checkWiFiAndReconnect() { ... }
 
 // ================= 引脚定义 =================
 #define RX_PIN 16
@@ -84,7 +62,7 @@ bool viewRawMode = false; // false=解析模式(默认), true=透传(Hex)模式
 
 // 自动检测相关
 unsigned long lastAutoCheckTime = 0;
-const unsigned long AUTO_CHECK_INTERVAL = 10000; // 10秒检查一次
+const unsigned long AUTO_CHECK_INTERVAL = 15000; // 15秒检查一次
 
 // 串口接收缓冲区
 String inputString = "";
@@ -125,9 +103,15 @@ void endConfig(bool silent = false);
 // [新增] 脏数据清理函数
 void clearSerialBuffer() {
     unsigned long start = millis();
-    // 持续读取直到缓冲区为空，或者超过50ms（防止死循环）
-    while ((Serial1.available() > 0) && (millis() - start < 50)) {
+    int cleared = 0;
+    // 持续读取直到缓冲区为空，或者超过100ms（防止死循环）
+    while ((Serial1.available() > 0) && (millis() - start < 100)) {
         Serial1.read();
+        cleared++;
+    }
+    // 如果清理了数据，打印调试信息
+    if (cleared > 0) {
+        Serial.printf("[DEBUG] Cleared %d bytes from serial buffer\n", cleared);
     }
 }
 
@@ -356,35 +340,103 @@ void setup() {
     
     delay(1000);
     Serial.println("\n\n==============================================");
-    Serial.println("      LD2450 Radar Controller (Safe Init)     ");
+    Serial.println("      LD2450 Radar Controller     ");
     Serial.println("==============================================");
 
-    // WiFi连接
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
-    Serial.print("Connecting to WiFi");
-    int wifiTry = 0;
-    while (WiFi.status() != WL_CONNECTED && wifiTry < 20) {
-        delay(500);
-        Serial.print(".");
-        wifiTry++;
+    // [优化策略] 热重启优化：先尝试256000默认波特率
+    Serial.println("Trying default 256000 baud rate for hot restart...");
+    Serial1.begin(256000, SERIAL_8N1, RX_PIN, TX_PIN);
+    delay(100);
+    clearSerialBuffer();
+    
+    // 检查是否能接收到雷达数据
+    bool radarResponding = false;
+    unsigned long startTime = millis();
+    while (millis() - startTime < 2000) { // 2秒内检查
+        if (Serial1.available()) {
+            uint8_t b = Serial1.read();
+            parseRadarByte(b);
+            if (radarBufIdx >= 30 && radarBuf[28] == TAIL[0] && radarBuf[29] == TAIL[1]) {
+                radarResponding = true;
+                break;
+            }
+        }
     }
-    if (WiFi.status() == WL_CONNECTED) {
-        Serial.println("\nWiFi connected!");
-        Serial.print("IP: ");
-        Serial.println(WiFi.localIP());
-        // 仅开机时获取一次MAC
-        deviceMac = WiFi.macAddress();
-        Serial.print("Device MAC: ");
-        Serial.println(deviceMac);
+    
+    if (radarResponding) {
+        Serial.println("Radar responding at 256000 baud, sending reboot command...");
+        // 发送重启命令清理状态
+        sendRadarPacket(0x00A3, NULL, 0);
+        Serial1.flush();
+        delay(2000); // 等待雷达重启
+        
+        // 重启后再次验证连接
+        clearSerialBuffer();
+        radarBufIdx = 0;
+        startTime = millis();
+        radarResponding = false;
+        while (millis() - startTime < 2000) {
+            if (Serial1.available()) {
+                uint8_t b = Serial1.read();
+                parseRadarByte(b);
+                if (radarBufIdx >= 30 && radarBuf[28] == TAIL[0] && radarBuf[29] == TAIL[1]) {
+                    radarResponding = true;
+                    break;
+                }
+            }
+        }
+        
+        if (radarResponding) {
+            Serial.println("Radar reconnected successfully at 256000 baud!");
+            currentBaudRate = 256000;
+            isBaudLocked = true;
+        } else {
+            Serial.println("Radar not responding after reboot, falling back to baud rate scan...");
+            Serial1.end();
+            scanBaudRate();
+        }
     } else {
-        Serial.println("\nWiFi connect failed, continue serial only.");
+        Serial.println("Radar not responding at 256000 baud, starting baud rate scan...");
+        Serial1.end();
+        scanBaudRate();
     }
 
-    scanBaudRate();
+    // WiFi连接
+    bool wifiConnected = initWiFi();
 
-    // [新增] 上电后自动重启雷达
-    runCmd("Initial Reboot Module", 0x00A3, NULL, 0);
+    // 雷达通信建立后，查询并显示完整信息
+    if (isBaudLocked) {
+        Serial.println("\n--- System Status Report ---");
+        Serial.printf("Radar Baud Rate: %ld\n", currentBaudRate);
+        
+        if (wifiConnected) {
+            Serial.println("WiFi Status: Connected");
+            Serial.print("WiFi IP: ");
+            Serial.println(WiFi.localIP());
+            Serial.print("Device MAC: ");
+            Serial.println(deviceMac);
+        } else {
+            Serial.println("WiFi Status: Disconnected");
+        }
+        
+        // 查询雷达信息
+        Serial.println("\nQuerying radar information...");
+        runCmd("Query Version", 0x00A0, NULL, 0);
+        delay(200);
+        runCmd("Query MAC", 0x00A5, (uint16_t)0x0001);
+        delay(200);
+        runCmd("Query Mode", 0x0091, NULL, 0);
+        delay(200);
+        runCmd("Query Zone", 0x00C1, NULL, 0);
+        
+        // 保存初始配置
+        Serial.println("\n--- Initial Configuration Saved ---");
+        Serial.println("System ready. Type '?' for help.");
+        printHelp(false);
+    } else {
+        Serial.println("Warning: Radar communication not established.");
+        Serial.println("You may need to check connections or try manual baud rate scan.");
+    }
 }
 
 void loop() {
@@ -540,7 +592,7 @@ void loop() {
 void printHelp(bool showAll) {
     Serial.println("\n\n================ LD2450 安全控制台 ================");
     Serial.println(" [提示] 输入命令后按回车发送");
-    Serial.println(" [自动] 系统每10秒会自动检查一次配置(仅在解析模式下)。");
+    Serial.println(" [自动] 系统每15秒会自动检查一次配置(仅在解析模式下)。");
     
     Serial.println("\n--- 透传与连接 ---");
     Serial.printf("  %-14s : %s\n", "bridge", "【桥接】进入透明传输模式 (连接官方上位机用)");
@@ -564,7 +616,7 @@ void printHelp(bool showAll) {
     Serial.printf("  %-14s : %s\n", "reboot", "重启模块");
     Serial.printf("  %-14s : %s\n", "factory", "恢复出厂设置");
     Serial.println("===================================================");
-    Serial.println("注: Target: [T1 x,y] 表示目标1的X坐标和Y坐标，单位为毫米");
+    Serial.println("注: Target: [T1 x,y] 表示目标1的[X左右方向角度坐标] [Y距离坐标，单位为毫米]");
     Serial.println();
 }
 
@@ -664,27 +716,38 @@ void scanBaudRate() {
     
     Serial.println("\n--- Scanning Baud Rate ---");
 
-    while(!isBaudLocked) {
+    int retryCount = 0;
+    const int MAX_RETRIES = 5; // 最多重试5次
+
+    while(!isBaudLocked && retryCount < MAX_RETRIES) {
         for (int i = 0; i < numRates; i++) {
             long rate = RATES[i];
             Serial.printf("Trying %ld... ", rate);
             
             Serial1.end();
+            delay(200); // 增加关闭等待时间
+            
             Serial1.setRxBufferSize(2048);
             Serial1.begin(rate, SERIAL_8N1, RX_PIN, TX_PIN);
             
-            // [新增] 关键：等待串口稳定并清理脏数据
-            delay(50);
+            // [增强] 多重清理策略
+            delay(200); // 等待串口稳定
+            clearSerialBuffer(); // 清理当前缓冲区
+            delay(300); // 额外等待，让雷达的旧数据流逝
+            
+            // [增强] 再次清理，确保缓冲区干净
             clearSerialBuffer();
             
             unsigned long scanStart = millis();
             int matchCount = 0;
             int cfgMatchCount = 0;
             bool found = false;
+            int bytesReceived = 0;
             
-            while (millis() - scanStart < 1200) {
+            while (millis() - scanStart < 2000) { // 增加扫描时间到2秒
                 if (Serial1.available()) {
                     uint8_t b = Serial1.read();
+                    bytesReceived++;
                     
                     if (matchCount == 0 && b == 0xAA) matchCount++;
                     else if (matchCount == 1 && b == 0xFF) matchCount++;
@@ -699,34 +762,42 @@ void scanBaudRate() {
                     else { if (b == 0xFD) cfgMatchCount = 1; else cfgMatchCount = 0; }
                 }
             }
+            
             if (found) {
-                Serial.println("LOCKED!");
+                Serial.printf("LOCKED! (received %d bytes)\n", bytesReceived);
                 currentBaudRate = rate;
                 isBaudLocked = true;
                 Serial.println("Ready. Type '?' for help.");
                 printHelp(false);
                 return;
-            } else { Serial.println("No"); }
-        }
-        
-        Serial.println("Scan failed. Auto-retrying in 2 seconds...");
-        Serial.println("(Press any key to stop scanning and enter console)");
-        
-        unsigned long waitStart = millis();
-        while(millis() - waitStart < 2000) {
-            if (Serial.available()) {
-                Serial.println("\n>> Scan aborted by user.");
-                isBaudLocked = true; 
-                return;
+            } else {
+                Serial.printf("No (%d bytes received)\n", bytesReceived);
             }
         }
-        Serial.println("\n--- Retrying Scan ---");
+        
+        retryCount++;
+        if (retryCount < MAX_RETRIES) {
+            Serial.printf("\nScan failed. Auto-retrying in 3 seconds... (attempt %d/%d)\n", retryCount + 1, MAX_RETRIES);
+            Serial.println("(Press any key to stop scanning and enter console)");
+            
+            unsigned long waitStart = millis();
+            while(millis() - waitStart < 3000) {
+                if (Serial.available()) {
+                    Serial.println("\n>> Scan aborted by user.");
+                    isBaudLocked = true; 
+                    return;
+                }
+            }
+            Serial.println("\n--- Retrying Scan ---");
+        }
     }
-}
-
-int16_t parseCoordinate(uint16_t raw) {
-    if (raw & 0x8000) return (int16_t)(raw & 0x7FFF);
-    else return -(int16_t)(raw & 0x7FFF);
+    
+    if (!isBaudLocked) {
+        Serial.println("\n>> Maximum retries exceeded. Entering console mode anyway.");
+        Serial.println("You may need to manually reset or check radar connection.");
+        Serial.println("Ready. Type '?' for help.");
+        printHelp(false);
+    }
 }
 
 void parseRadarByte(uint8_t b) {
@@ -757,10 +828,15 @@ void parseRadarByte(uint8_t b) {
                 if (millis() - lastDataPrintTime > DATA_PRINT_INTERVAL) {
                     String output = "Target: ";
                     bool hasTarget = false;
-                    for (int i=0; i<3; i++) {
+                    // 根据雷达模式决定输出目标数量
+                    // 0x01=单目标，0x02=多目标，-1=未知（默认多目标）
+                    int targetCount = (lastKnownMode == 0x01) ? 1 : 3;
+                    for (int i=0; i<targetCount; i++) {
                         int base = 4 + i*8;
-                        int16_t x = parseCoordinate(radarBuf[base] | (radarBuf[base+1]<<8));
-                        int16_t y = parseCoordinate(radarBuf[base+2] | (radarBuf[base+3]<<8));
+                        uint16_t rawX = radarBuf[base] | (radarBuf[base+1]<<8);
+                        uint16_t rawY = radarBuf[base+2] | (radarBuf[base+3]<<8);
+                        int16_t x = (rawX & 0x8000) ? (int16_t)(rawX - 0x8000) : -(int16_t)(rawX & 0x7FFF);
+                        int16_t y = (int16_t)(rawY - 0x8000);
                         if (x != 0 || y != 0) {
                             char tmp[32];
                             sprintf(tmp, "[T%d %d,%d] ", i+1, x, y);
@@ -772,7 +848,7 @@ void parseRadarByte(uint8_t b) {
                     else Serial.print(".");
                     lastDataPrintTime = millis();
                 } else { 
-                    if (millis() % 500 < 20 && millis() % 100 == 0) Serial.print("❤️\n"); 
+                    if (millis() % 500 < 20 && millis() % 100 == 0) Serial.print("[❤️ ]\n"); 
                 }
             }
             radarBufIdx = 0;
