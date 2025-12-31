@@ -4,7 +4,7 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 // ================= 网络配置 =================
-const char* WIFI_SSID = "Link2you?"; // TODO: 替换为实际WiFi YOUR_WIFI_SSID
+const char* WIFI_SSID = "Link2you?"; // WiFi YOUR_WIFI_SSID
 const char* WIFI_PASS = "12345678";//YOUR_WIFI_PASSWORD
 const char* SERVER_URL = "http://link2you.top:5000/api/v1/device/sync";
 
@@ -25,64 +25,44 @@ Target targets[3];
 extern uint8_t radarBuf[64];
 int16_t parseCoordinate(uint16_t raw);
 
+// 自动检测相关全局变量
+int lastKnownMode = -1; // -1 表示未知，用于对比配置变化
+
 // 解析雷达数据并填充targets数组
 void parseTargetsFromRadarBuf() {
     for (int i = 0; i < 3; i++) {
         int base = 4 + i * 8;
         targets[i].x = parseCoordinate(radarBuf[base] | (radarBuf[base+1]<<8));
         targets[i].y = parseCoordinate(radarBuf[base+2] | (radarBuf[base+3]<<8));
-        targets[i].speed = 0; // 可根据协议补充
-        targets[i].resolution = 0;
+        targets[i].speed = parseCoordinate(radarBuf[base+4] | (radarBuf[base+5]<<8));
+        targets[i].resolution = radarBuf[base+6] | (radarBuf[base+7]<<8);
     }
 }
 
 // 全局变量：仅开机获取一次MAC
 String deviceMac = "";
 
-// JSON封装并上传到服务器（仅用全局MAC，动态调整上传频率）
-void uploadDataToServer() {
-    if (WiFi.status() != WL_CONNECTED) return;
-    WiFiClient client;
-    HTTPClient http;
-    http.begin(client, SERVER_URL);
-    http.addHeader("Content-Type", "application/json");
-
-    // 使用新版API，消除警告
-    ArduinoJson::StaticJsonDocument<256> doc;
-    doc["device_mac"] = deviceMac;
-    auto arr = doc["targets"].to<ArduinoJson::JsonArray>();
-    for (int i = 0; i < 3; i++) {
-        auto obj = arr.add<ArduinoJson::JsonObject>();
-        obj["x"] = targets[i].x;
-        obj["y"] = targets[i].y;
-        obj["speed"] = targets[i].speed;
-        obj["resolution"] = targets[i].resolution;
-    }
-
-    String payload;
-    serializeJson(doc, payload);
-
-    int httpCode = http.POST(payload);
-    if (httpCode > 0) {
-        String resp = http.getString();
-        // 解析响应，动态调整上传间隔（支持加速/降频）
-        ArduinoJson::StaticJsonDocument<256> respDoc;
-        ArduinoJson::DeserializationError err = deserializeJson(respDoc, resp);
-        if (!err && respDoc["data"]["next_interval"]) {
-            unsigned long nextInt = respDoc["data"]["next_interval"].as<unsigned long>();
-            // 只在值变化时打印提示
-            if (nextInt != uploadInterval) {
-                if (nextInt <= 100) {
-                    Serial.println("[SYNC] 进入加速上传模式 (10Hz)");
-                } else {
-                    Serial.println("[SYNC] 切换为低频上传 (1Hz)");
-                }
-            }
-            uploadInterval = nextInt;
+// WiFi连接状态检测与自动重连
+void checkWiFiAndReconnect() {
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("[WiFi] 连接丢失，正在尝试重连...");
+        WiFi.disconnect();
+        WiFi.begin(WIFI_SSID, WIFI_PASS);
+        int wifiTry = 0;
+        while (WiFi.status() != WL_CONNECTED && wifiTry < 10) {
+            delay(500);
+            Serial.print(".");
+            wifiTry++;
         }
-        // 处理pending_cmd等可扩展
+        if (WiFi.status() == WL_CONNECTED) {
+            Serial.println("\n[WiFi] 重新连接成功!");
+            Serial.print("IP: ");
+            Serial.println(WiFi.localIP());
+            deviceMac = WiFi.macAddress();
+        } else {
+            Serial.println("\n[WiFi] 重新连接失败。");
+        }
     }
-    http.end();
 }
 
 // ================= 引脚定义 =================
@@ -95,13 +75,16 @@ bool isBaudLocked = false;
 unsigned long lastDataPrintTime = 0;
 const unsigned long DATA_PRINT_INTERVAL = 3000; // 3秒输出一次雷达坐标数据
 
+// raw模式限流
+unsigned long lastRawPrintTime = 0;
+const unsigned long RAW_PRINT_INTERVAL = 1000; // 1秒输出一次raw数据
+
 // 显示模式控制
 bool viewRawMode = false; // false=解析模式(默认), true=透传(Hex)模式
 
 // 自动检测相关
 unsigned long lastAutoCheckTime = 0;
 const unsigned long AUTO_CHECK_INTERVAL = 10000; // 10秒检查一次
-int lastKnownMode = -1; // -1 表示未知，用于对比配置变化
 
 // 串口接收缓冲区
 String inputString = "";
@@ -131,6 +114,7 @@ void printHelp(bool showAll);
 void scanBaudRate();
 void parseRadarByte(uint8_t b);
 int16_t parseCoordinate(uint16_t raw);
+void uploadDataToServer();
 
 // 核心执行函数
 void runCmd(const char* name, uint16_t cmdWord, uint8_t* val, uint16_t valLen);
@@ -160,9 +144,80 @@ void requestAction(const char* name, uint16_t cmdWord, uint16_t valInt, uint16_t
     awaitingConfirmation = true;
 }
 
-// 批量查询当前状态
+
+// JSON封装并上传到服务器（根据当前模式动态上传目标数量）
+void uploadDataToServer() {
+    checkWiFiAndReconnect();
+    if (WiFi.status() != WL_CONNECTED) return;
+    WiFiClient client;
+    HTTPClient http;
+    http.begin(client, SERVER_URL);
+    http.addHeader("Content-Type", "application/json");
+
+    // 使用新版API，消除警告
+    ArduinoJson::JsonDocument doc;
+    doc["device_mac"] = deviceMac;
+    auto arr = doc["targets"].to<ArduinoJson::JsonArray>();
+
+    // 根据lastKnownMode判断上传目标数量
+    // 0x01=单目标，0x02=多目标，-1=未知（默认多目标）
+    int targetCount = (lastKnownMode == 0x01) ? 1 : 3;
+    for (int i = 0; i < targetCount; i++) {
+        auto obj = arr.add<ArduinoJson::JsonObject>();
+        obj["x"] = targets[i].x;
+        obj["y"] = targets[i].y;
+        obj["speed"] = targets[i].speed;
+        obj["resolution"] = targets[i].resolution;
+    }
+
+    String payload;
+    serializeJson(doc, payload);
+
+    int httpCode = http.POST(payload);
+    if (httpCode > 0) {
+        String resp = http.getString();
+        // 解析响应，动态调整上传间隔（支持加速/降频）
+        ArduinoJson::JsonDocument respDoc;
+        ArduinoJson::DeserializationError err = deserializeJson(respDoc, resp);
+        if (!err && respDoc["data"]["next_interval"]) {
+            unsigned long nextInt = respDoc["data"]["next_interval"].as<unsigned long>();
+            // 只在值变化时打印提示
+            if (nextInt != uploadInterval) {
+                if (nextInt <= 100) {
+                    Serial.println("[SYNC] 进入加速上传模式 (10Hz)");
+                } else {
+                    Serial.println("[SYNC] 切换为低频上传 (1Hz)");
+                }
+            }
+            uploadInterval = nextInt;
+        }
+        // 处理pending_cmd等可扩展
+    }
+    http.end();
+}
+
+// 批量查询当前状态，增加WiFi状态显示
 void queryAllInfo() {
     Serial.println("\n=== Fetching Device Status ===");
+    // WiFi状态
+    Serial.print("[WiFi] 状态: ");
+    wl_status_t wifiStatus = WiFi.status();
+    if (wifiStatus == WL_CONNECTED) {
+        Serial.print("已连接  IP: ");
+        Serial.print(WiFi.localIP());
+        Serial.print("  MAC: ");
+        Serial.println(WiFi.macAddress());
+    } else if (wifiStatus == WL_NO_SSID_AVAIL) {
+        Serial.println("找不到SSID");
+    } else if (wifiStatus == WL_CONNECT_FAILED) {
+        Serial.println("连接失败");
+    } else if (wifiStatus == WL_IDLE_STATUS) {
+        Serial.println("空闲");
+    } else if (wifiStatus == WL_DISCONNECTED) {
+        Serial.println("未连接");
+    } else {
+        Serial.println("未知");
+    }
     runCmd("Query Version", 0x00A0, NULL, 0); delay(100); 
     runCmd("Query MAC", 0x00A5, (uint16_t)0x0001); delay(100);
     runCmd("Query Mode", 0x0091, NULL, 0); delay(100);
@@ -312,11 +367,18 @@ void setup() {
 
     scanBaudRate();
 
-        // [新增] 上电后自动重启雷达
-        runCmd("Reboot Module", 0x00A3, NULL, 0);
+    // [新增] 上电后自动重启雷达
+    runCmd("Initial Reboot Module", 0x00A3, NULL, 0);
 }
 
 void loop() {
+    // 0. 定期检测WiFi连接并自动重连
+    static unsigned long lastWiFiCheck = 0;
+    if (millis() - lastWiFiCheck > 5000) { // 每5秒检测一次
+        checkWiFiAndReconnect();
+        lastWiFiCheck = millis();
+    }
+
     // 1. 处理 PC 串口输入
     if (Serial.available()) {
         char inChar = (char)Serial.read();
@@ -485,7 +547,9 @@ void printHelp(bool showAll) {
     Serial.println("\n--- 危险操作 (需确认) ---");
     Serial.printf("  %-14s : %s\n", "reboot", "重启模块");
     Serial.printf("  %-14s : %s\n", "factory", "恢复出厂设置");
-    Serial.println("===================================================\n");
+    Serial.println("===================================================");
+    Serial.println("注: Target: [T1 x,y] 表示目标1的X坐标和Y坐标，单位为毫米");
+    Serial.println();
 }
 
 void sendRadarPacket(uint16_t cmdWord, uint8_t* value, uint16_t valueLen) {
@@ -645,8 +709,8 @@ void scanBaudRate() {
 }
 
 int16_t parseCoordinate(uint16_t raw) {
-    if (raw & 0x8000) return -(int16_t)(raw & 0x7FFF);
-    else return (int16_t)(raw & 0x7FFF);
+    if (raw & 0x8000) return (int16_t)(raw & 0x7FFF);
+    else return -(int16_t)(raw & 0x7FFF);
 }
 
 void parseRadarByte(uint8_t b) {
@@ -662,11 +726,16 @@ void parseRadarByte(uint8_t b) {
         
         if (radarBufIdx >= 30 && radarBuf[28] == TAIL[0] && radarBuf[29] == TAIL[1]) {
             if (viewRawMode) {
-                Serial.print("RAW: ");
-                for (int i = 0; i < radarBufIdx; i++) {
-                    Serial.printf("%02X ", radarBuf[i]);
+                if (millis() - lastRawPrintTime > RAW_PRINT_INTERVAL) {
+                    Serial.print("RAW: ");
+                    for (int i = 0; i < radarBufIdx; i++) {
+                        Serial.printf("%02X ", radarBuf[i]);
+                    }
+                    Serial.println();
+                    lastRawPrintTime = millis();
+                } else {
+                    if (millis() % 500 < 20 && millis() % 100 == 0) Serial.print("🔄\n");
                 }
-                Serial.println();
             }
             else {
                 if (millis() - lastDataPrintTime > DATA_PRINT_INTERVAL) {
