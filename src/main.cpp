@@ -192,6 +192,22 @@ void uploadDataToServer() {
             uploadInterval = nextInt;
         }
         // 处理pending_cmd等可扩展
+        if (!err && respDoc["data"]["pending_cmd"].is<JsonObject>()) {
+            String cmdType = respDoc["data"]["pending_cmd"]["command_type"];
+            Serial.printf("[SYNC] 执行指令: %s\n", cmdType.c_str());
+            
+            if (cmdType == "REBOOT") {
+                runCmd("Remote Reboot", 0x00A3, NULL, 0);
+            } else if (cmdType == "SET_MODE") {
+                String mode = respDoc["data"]["pending_cmd"]["payload"]["mode"];
+                if (mode == "single") {
+                    runCmd("Set Single Target", 0x0080, NULL, 0);
+                } else if (mode == "multi") {
+                    runCmd("Set Multi Target", 0x0090, NULL, 0);
+                }
+            }
+            // SET_ZONE指令标记为未来版本
+        }
     }
     http.end();
 }

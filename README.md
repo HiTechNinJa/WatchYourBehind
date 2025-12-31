@@ -59,6 +59,19 @@
 **解决**：
 
 - 确认了 LD2450 的硬件机制——蓝牙配置必须重启生效。代码中添加了专门的提示语 `>> NOTICE: Please execute 'reboot'...`，引导用户正确操作。
+
+## 6. 远程指令执行
+
+**问题**：需要实现前端通过服务器远程控制ESP32设备的功能，包括设备重启和模式切换。
+
+**解决**：
+
+- **指令传递机制**：采用"捎带响应"策略，ESP32在数据上报时通过HTTP请求携带指令，服务器在响应中返回待执行指令。
+- **指令解析逻辑**：在`uploadDataToServer()`函数中添加指令解析代码，检查服务器响应中的`pending_cmd`字段。
+- **指令执行映射**：支持`REBOOT`指令（调用`runCmd("Remote Reboot", 0x00A3, NULL, 0)`）和`SET_MODE`指令（根据payload.mode调用相应的雷达配置命令）。
+- **兼容性修复**：更新ArduinoJson使用方式，使用`respDoc["data"]["pending_cmd"].is<JsonObject>()`替代已弃用的`containsKey()`方法。
+- **指令队列**：服务器支持指令排队，ESP32每次只执行一个指令，确保执行顺序和可靠性。
+
 # 开发日志
 
 - [2025-12-31 UTC] 
@@ -69,3 +82,4 @@
 5.  完善雷达数据解析：修改parseTargetsFromRadarBuf()函数，正确解析速度(speed)和分辨率(resolution)字段，不再硬编码为0。
 6.  优化数据上传逻辑：设备端检测到为单目标模式（Single Target）时，仅上传T1目标数据，多目标模式下才上传全部3个目标，避免数据库冗余无效目标。
 - [2025-12-30 UTC] 板端 ESP32 上电后自动重启雷达，提升初始化可靠性。已在 setup() 末尾插入 runCmd("Reboot Module", 0x00A3, NULL, 0)，无需人工干预，雷达可自动恢复数据上传。
+- [2025-12-31 UTC] 实现远程指令执行功能，支持前端通过服务器下发指令控制ESP32。已在uploadDataToServer()函数中添加指令解析逻辑，支持REBOOT（重启设备）和SET_MODE（设置单/多目标模式）指令。指令通过HTTP响应中的pending_cmd字段传递，ESP32在下次数据上报时执行相应runCmd()调用。修复ArduinoJson兼容性问题，使用is<JsonObject>()方法替代已弃用的containsKey()方法。
